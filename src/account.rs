@@ -18,7 +18,8 @@
 //!
 //! Accounts compatible with BIP32, BIP39, BIP44, BIP49, BIP84
 //!
-use bitcoin::hashes::{hash160, Hash};
+use bitcoin::secp256k1;
+use bitcoin::hashes::{hash160, Hash, HashEngine};
 use bitcoin::util::bip32::ExtendedPubKey;
 use bitcoin::{
     blockdata::script::Builder,
@@ -810,6 +811,68 @@ impl InstantiatedKey {
 pub struct Seed(pub Vec<u8>);
 
 impl Seed {
+    pub fn encrypt_elgamal(&self, encryption_key: &secp256k1::PublicKey) -> Result<Vec<u8>, Error> {
+        use bitcoin::hashes::{sha256, Hash};
+
+        let mut engine = sha256::Hash::engine();
+        engine.input(&encryption_key.serialize());
+        let mut hash = sha256::Hash::from_engine(engine);
+
+        let mut buf = self.0.clone();
+        if buf.len() % 30 != 0 {
+            let even = (buf.len() / 30 + 1) * 30;
+            buf.extend_from_slice(&hash[..even - buf.len()])
+        }
+        let mut buf = &buf[..];
+        let mut acc = vec![];
+        while buf.len() > 0 {
+            let chunk30 = &buf[..30];
+            let mut chunk33 = [0u8; 33];
+            chunk33[0] = 2;
+            chunk33[1..31].copy_from_slice(&chunk30);
+            acc.push(loop {
+                chunk33[31..33].copy_from_slice(&hash[..2]);
+                if let Ok(pubkey) = secp256k1::PublicKey::from_slice(&chunk33) {
+                    break pubkey.combine(encryption_key)?.serialize()[1..].to_vec();
+                }
+                let mut engine = sha256::Hash::engine();
+                engine.input(&hash);
+                hash = sha256::Hash::from_engine(engine);
+            });
+            buf = &buf[30..];
+        }
+        Ok(acc.concat())
+    }
+
+    pub fn decrypt_elgamal(mut encrypted: &[u8], decryption_key: &secp256k1::SecretKey) -> Result<Seed, Error> {
+        use bitcoin::hashes::{sha256, Hash};
+
+        if encrypted.len() % 32 != 0 {
+            return Err(Error::Unsupported("Incorrect encrypted message length"))
+        }
+        let mut acc = vec![];
+        let context = secp256k1::Secp256k1::new();
+        let encryption_key = secp256k1::PublicKey::from_secret_key(&context, decryption_key);
+        let neg = &mut encryption_key.serialize()[..];
+        // TODO: Do a proper negation once rust-secp256k1 will have a neg fn
+        if neg[0] == 2 {
+            neg[0] = 3;
+        } else {
+            neg[0] = 2;
+        }
+
+        while encrypted.len() > 0 {
+            let chunk33 = [&[2u8], &encrypted[..32]].concat();
+            let pubkey = secp256k1::PublicKey::from_slice(&chunk33)
+                .map_err(|_| Error::Unsupported("Incorrect encrypted message"))?;
+            let pubkey = pubkey.combine(&encryption_key)?;
+            let chunk30 = &pubkey.serialize()[1..31];
+            acc.push(chunk30.to_vec());
+            encrypted = &encrypted[32..];
+        }
+        Ok(Seed(acc.concat()))
+    }
+
     /// encrypt seed
     /// encryption algorithm: AES256(Sha256(passphrase), ECB, PKCS padding
     pub fn encrypt(&self, passphrase: &str) -> Result<Vec<u8>, Error> {
@@ -1388,5 +1451,22 @@ mod test {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_elgamal() {
+        use rand::{thread_rng, RngCore};
+        let mut entropy = [0u8; 32];
+        thread_rng().fill_bytes(&mut entropy);
+        let msg1 = "Some phrase  with a short length";
+        let seed = Seed(msg1.as_bytes().to_vec());
+        let privkey = secp256k1::SecretKey::from_slice(&entropy).unwrap();
+        let context = secp256k1::Secp256k1::new();
+        let pubkey = secp256k1::PublicKey::from_secret_key(&context, &privkey);
+        let encrypted = seed.encrypt_elgamal(&pubkey).unwrap();
+        let decrypted = Seed::decrypt_elgamal(&encrypted, &privkey).unwrap();
+        let msg2 = String::from_utf8(decrypted.0[..seed.0.len()].to_vec()).unwrap();
+        assert_eq!(msg1, msg2);
+        assert_ne!(msg1.as_bytes()[..30], encrypted[1..31]);
     }
 }
